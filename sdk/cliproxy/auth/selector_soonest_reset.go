@@ -25,13 +25,18 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	best, bestReset := available[0], quotaResetAt(available[0], now)
+	best, bestReset := available[0], usageResetAt(available[0], now)
 	for _, candidate := range available[1:] {
-		if reset := quotaResetAt(candidate, now); resetsSooner(reset, bestReset) {
+		if reset := usageResetAt(candidate, now); resetsSooner(reset, bestReset) {
 			best, bestReset = candidate, reset
 		}
 	}
 	return best, nil
+}
+
+func usageResetAt(auth *Auth, now time.Time) time.Time {
+	window, _ := LongestUsageWindow(auth, now)
+	return window.ResetAt
 }
 
 // resetsSooner orders an unknown (zero) reset before every known one.
@@ -42,47 +47,61 @@ func resetsSooner(a, b time.Time) bool {
 	return a.Before(b)
 }
 
-// quotaResetAt returns when the credential's longest observed usage window resets, or the zero
-// time when no future reset is known. The longest window is the one that matters: a five-hour
-// window refills by itself within the day, weekly quota left at its reset is lost.
-func quotaResetAt(auth *Auth, now time.Time) time.Time {
-	if auth == nil {
-		return time.Time{}
-	}
-	signals := auth.Quota.Signals
-	var reset time.Time
-	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
-	case "claude":
-		reset = unixSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset")
-		if reset.IsZero() {
-			reset = unixSignal(signals, "Anthropic-Ratelimit-Unified-Reset")
-		}
-	case "codex":
-		reset = codexLongestWindowReset(signals, auth.Quota.ObservedAt)
-	}
-	if !reset.After(now) {
-		return time.Time{}
-	}
-	return reset
+// UsageWindow is the usage window soonest-reset routing ranks a credential by.
+type UsageWindow struct {
+	ResetAt time.Time
+	// UsedPercent is 0-100, or -1 when the provider did not report it.
+	UsedPercent float64
 }
 
-func codexLongestWindowReset(signals map[string]string, observedAt time.Time) time.Time {
-	var reset time.Time
+// LongestUsageWindow returns the credential's longest observed usage window that resets in the
+// future. The longest window is the one that matters: a five-hour window refills by itself within
+// the day, weekly quota left at its reset is lost. ok is false when no future reset is known.
+func LongestUsageWindow(auth *Auth, now time.Time) (window UsageWindow, ok bool) {
+	if auth == nil {
+		return UsageWindow{}, false
+	}
+	signals := auth.Quota.Signals
+	window.UsedPercent = -1
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude":
+		if window.ResetAt = unixSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset"); !window.ResetAt.IsZero() {
+			if used, ok := floatSignal(signals, "Anthropic-Ratelimit-Unified-7d-Utilization"); ok {
+				window.UsedPercent = used * 100
+			}
+		} else {
+			window.ResetAt = unixSignal(signals, "Anthropic-Ratelimit-Unified-Reset")
+		}
+	case "codex":
+		window = codexLongestWindow(signals, auth.Quota.ObservedAt)
+	}
+	if !window.ResetAt.After(now) {
+		return UsageWindow{}, false
+	}
+	return window, true
+}
+
+func codexLongestWindow(signals map[string]string, observedAt time.Time) UsageWindow {
+	window := UsageWindow{UsedPercent: -1}
 	longest := int64(0)
-	for _, window := range []string{"Primary", "Secondary"} {
-		minutes, ok := intSignal(signals, "X-Codex-"+window+"-Window-Minutes")
+	for _, name := range []string{"Primary", "Secondary"} {
+		minutes, ok := intSignal(signals, "X-Codex-"+name+"-Window-Minutes")
 		if !ok || minutes <= longest {
 			continue
 		}
-		at := unixSignal(signals, "X-Codex-"+window+"-Reset-At")
-		if seconds, ok := intSignal(signals, "X-Codex-"+window+"-Reset-After-Seconds"); at.IsZero() && ok && seconds > 0 && !observedAt.IsZero() {
+		at := unixSignal(signals, "X-Codex-"+name+"-Reset-At")
+		if seconds, ok := intSignal(signals, "X-Codex-"+name+"-Reset-After-Seconds"); at.IsZero() && ok && seconds > 0 && !observedAt.IsZero() {
 			at = observedAt.Add(time.Duration(seconds) * time.Second)
 		}
-		if !at.IsZero() {
-			longest, reset = minutes, at
+		if at.IsZero() {
+			continue
+		}
+		longest, window.ResetAt, window.UsedPercent = minutes, at, -1
+		if used, ok := floatSignal(signals, "X-Codex-"+name+"-Used-Percent"); ok {
+			window.UsedPercent = used
 		}
 	}
-	return reset
+	return window
 }
 
 func intSignal(signals map[string]string, name string) (int64, bool) {
@@ -91,6 +110,15 @@ func intSignal(signals map[string]string, name string) (int64, bool) {
 		return 0, false
 	}
 	parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return parsed, err == nil
+}
+
+func floatSignal(signals map[string]string, name string) (float64, bool) {
+	value, ok := signals[name]
+	if !ok {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 	return parsed, err == nil
 }
 

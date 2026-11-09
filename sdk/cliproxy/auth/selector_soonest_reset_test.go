@@ -149,3 +149,23 @@ func TestSoonestResetSelectorBehindSessionAffinity(t *testing.T) {
 		t.Fatalf("picked %q, want b-soon", got.ID)
 	}
 }
+
+func TestLongestUsageWindowReportsUsedPercent(t *testing.T) {
+	now := time.Now()
+	claude := claudeAuthResettingAt("claude", now.Add(time.Hour))
+	claude.Quota.Signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = "0.24"
+	if window, ok := LongestUsageWindow(claude, now); !ok || window.UsedPercent != 24 {
+		t.Fatalf("claude window = %+v, %v; want 24%% used", window, ok)
+	}
+	codex := &Auth{ID: "codex", Provider: "codex", Quota: QuotaState{Signals: map[string]string{
+		"X-Codex-Primary-Window-Minutes": "10080",
+		"X-Codex-Primary-Reset-At":       strconv.FormatInt(now.Add(time.Hour).Unix(), 10),
+		"X-Codex-Primary-Used-Percent":   "33",
+	}}}
+	if window, ok := LongestUsageWindow(codex, now); !ok || window.UsedPercent != 33 {
+		t.Fatalf("codex window = %+v, %v; want 33%% used", window, ok)
+	}
+	if _, ok := LongestUsageWindow(&Auth{ID: "fresh", Provider: "claude"}, now); ok {
+		t.Fatal("a credential without signals reported a usage window")
+	}
+}
