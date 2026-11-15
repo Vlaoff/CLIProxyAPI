@@ -169,3 +169,34 @@ func TestLongestUsageWindowReportsUsedPercent(t *testing.T) {
 		t.Fatal("a credential without signals reported a usage window")
 	}
 }
+
+func TestSoonestResetSelectorRemembersWindowsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	SetSoonestResetStateDir(dir)
+	t.Cleanup(func() { SetSoonestResetStateDir("") })
+	now := time.Now()
+	// Before the restart both credentials answered once.
+	pickSoonestReset(t, "claude",
+		claudeAuthResettingAt("a-late", now.Add(6*24*time.Hour)),
+		claudeAuthResettingAt("b-soon", now.Add(20*time.Hour)),
+	)
+	SetSoonestResetStateDir("")
+	SetSoonestResetStateDir(dir) // a new process: the memory is reloaded from disk
+
+	// After it neither has live signals: b-soon must still win, not whichever comes first.
+	got := pickSoonestReset(t, "claude",
+		&Auth{ID: "a-late", Provider: "claude"},
+		&Auth{ID: "b-soon", Provider: "claude"},
+	)
+	if got != "b-soon" {
+		t.Fatalf("picked %q, want b-soon", got)
+	}
+	// A credential never seen is still tried first.
+	got = pickSoonestReset(t, "claude",
+		&Auth{ID: "b-soon", Provider: "claude"},
+		&Auth{ID: "c-new", Provider: "claude"},
+	)
+	if got != "c-new" {
+		t.Fatalf("picked %q, want c-new", got)
+	}
+}

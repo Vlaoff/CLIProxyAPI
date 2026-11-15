@@ -56,7 +56,8 @@ type UsageWindow struct {
 
 // LongestUsageWindow returns the credential's longest observed usage window that resets in the
 // future. The longest window is the one that matters: a five-hour window refills by itself within
-// the day, weekly quota left at its reset is lost. ok is false when no future reset is known.
+// the day, weekly quota left at its reset is lost. Without a live one, the window remembered from
+// before a restart is used (SetSoonestResetStateDir). ok is false when no future reset is known.
 func LongestUsageWindow(auth *Auth, now time.Time) (window UsageWindow, ok bool) {
 	if auth == nil {
 		return UsageWindow{}, false
@@ -76,8 +77,9 @@ func LongestUsageWindow(auth *Auth, now time.Time) (window UsageWindow, ok bool)
 		window = codexLongestWindow(signals, auth.Quota.ObservedAt)
 	}
 	if !window.ResetAt.After(now) {
-		return UsageWindow{}, false
+		return recalledUsageWindow(auth.ID, now)
 	}
+	rememberUsageWindow(auth.ID, window, now)
 	return window, true
 }
 
