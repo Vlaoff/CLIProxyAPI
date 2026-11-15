@@ -2,7 +2,11 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -198,5 +202,33 @@ func TestSoonestResetSelectorRemembersWindowsAcrossRestart(t *testing.T) {
 	)
 	if got != "c-new" {
 		t.Fatalf("picked %q, want c-new", got)
+	}
+}
+
+func TestSoonestResetMemoryIsNeverLoadedAsACredential(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	legacy, _ := json.Marshal(map[string]UsageWindow{"b-soon": {ResetAt: now.Add(20 * time.Hour)}})
+	if err := os.WriteFile(filepath.Join(dir, ".soonest-reset-windows.json"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	SetSoonestResetStateDir(dir)
+	t.Cleanup(func() { SetSoonestResetStateDir("") })
+	pickSoonestReset(t, "claude", claudeAuthResettingAt("a-late", now.Add(6*24*time.Hour)))
+
+	// The auth dir must hold no .json file of ours: the hub loads each one as an account.
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if strings.HasSuffix(strings.ToLower(entry.Name()), ".json") {
+			t.Fatalf("%s is in the auth dir: the hub would load it as a credential", entry.Name())
+		}
+	}
+	// The old file's windows are kept.
+	got := pickSoonestReset(t, "claude",
+		&Auth{ID: "a-late", Provider: "claude"},
+		&Auth{ID: "b-soon", Provider: "claude"},
+	)
+	if got != "b-soon" {
+		t.Fatalf("picked %q, want b-soon", got)
 	}
 }

@@ -2,6 +2,8 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +18,11 @@ import (
 // traffic to whichever answered first, and session affinity then kept whole conversations there.
 // The last known window of each credential is kept on disk and used until a response replaces it.
 
-const resetMemoryFile = ".soonest-reset-windows.json"
+// Never a .json name: the hub loads every .json file in the auth dir as a credential, which is how
+// the first version of this file showed up as a fake account on the routing page.
+const resetMemoryFile = ".soonest-reset-windows.state"
+
+const legacyResetMemoryFile = ".soonest-reset-windows.json"
 
 var resetMemory struct {
 	sync.Mutex
@@ -76,7 +82,17 @@ func loadResetMemoryLocked() bool {
 	}
 	if !resetMemory.loaded {
 		resetMemory.loaded, resetMemory.windows = true, map[string]UsageWindow{}
-		if data, err := os.ReadFile(resetMemory.path); err == nil {
+		data, err := os.ReadFile(resetMemory.path)
+		legacy := filepath.Join(filepath.Dir(resetMemory.path), legacyResetMemoryFile)
+		if errors.Is(err, fs.ErrNotExist) {
+			if data, err = os.ReadFile(legacy); err == nil {
+				defer saveResetMemoryLocked(time.Now())
+			}
+		}
+		if errRemove := os.Remove(legacy); errRemove != nil && !errors.Is(errRemove, fs.ErrNotExist) {
+			log.Warnf("soonest-reset: could not remove %s: %v", legacy, errRemove)
+		}
+		if err == nil {
 			if errDecode := json.Unmarshal(data, &resetMemory.windows); errDecode != nil {
 				log.Warnf("soonest-reset: ignoring %s: %v", resetMemory.path, errDecode)
 				resetMemory.windows = map[string]UsageWindow{}
